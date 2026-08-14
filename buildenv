@@ -1,0 +1,370 @@
+# bump: regex-version /REGEX_VERSION="(.*)"/ https://github.com/mrabarnett/mrab-regex.git|semver:*
+REGEX_VERSION="2026.8.12"
+
+###
+### Build control file for the regex port
+###
+### regex is a drop-in replacement for the standard library's re, with fuzzy
+### matching, Unicode property classes, possessive quantifiers and character
+### class set operations on top of it. It is a single C extension over the
+### Unicode tables it ships, with no external library dependencies and no
+### runtime dependencies, so the standard Python build system compiles it once
+### per interpreter and there is nothing to link against beyond the C runtime.
+###
+### It is wanted mostly for its consumers -- black, pdm and much of the
+### tooling that parses text depends on it.
+###
+### Upstream tags are bare CalVer, "2026.8.12", with no "v" prefix, and the
+### repository is mrabarnett/mrab-regex even though the distribution is
+### "regex".
+###
+
+export ZOPEN_PROJECT_NAME="regex"
+export ZOPEN_BUILD_LINE="STABLE"
+export ZOPEN_CATEGORIES="development library"
+
+export ZOPEN_STABLE_URL="https://github.com/mrabarnett/mrab-regex.git"
+export ZOPEN_STABLE_TAG="${REGEX_VERSION}"
+export ZOPEN_DEV_URL="https://github.com/mrabarnett/mrab-regex.git"
+
+# Nothing beyond a Python and a C compiler: src/_regex.c and
+# src/_regex_unicode.c are checked into the repository already generated, so
+# unlike msgpack there is no Cython step to run before the build.
+export ZOPEN_STABLE_DEPS="check_python"
+export ZOPEN_DEV_DEPS="check_python"
+export ZOPEN_RUNTIME_DEPS="check_python"
+
+export ZOPEN_BUILD_SYSTEM="Python"
+
+zopen_get_version() {
+  echo "${REGEX_VERSION}"
+}
+
+# Called once per interpreter, with that interpreter's environment active and
+# its freshly built wheel installed.
+zopen_python_test() {
+  REGEX_EXPECTED_VERSION="${REGEX_VERSION}" python - <<'PYEOF'
+import os
+import sys
+
+# The check must exercise the *installed wheel*, but zopen-build runs this with
+# the working directory set to the source tree, and upstream keeps the Python
+# package at the repository root -- so "./regex" is a complete, importable
+# package that happens to have no compiled extension. python also reads this
+# script from stdin, which puts the current directory on sys.path ahead of
+# site-packages, as an absolute path. Dropping only "" and "." is therefore not
+# enough; the entry has to be matched by resolved path.
+#
+# Getting this wrong does not fail quietly here the way it does for a package
+# with a pure Python fallback. It fails with
+#
+#   ImportError: cannot import name '_regex' from partially initialized
+#   module 'regex' (most likely due to a circular import)
+#
+# because regex/__init__.py reaches back into its own package for the
+# extension. The message points at a circular import; the cause is the wrong
+# copy of regex.
+#
+# realpath, not abspath: on z/OS /tmp is a symlink to /$SYSNAME/tmp, so a build
+# under /tmp has a working directory of /S0W1/tmp/... while a sys.path entry
+# spelled /tmp/... refers to the same directory. abspath does not resolve
+# symlinks, compares the two as different, and leaves the source tree in place.
+_here = os.path.realpath(os.getcwd())
+sys.path = [p for p in sys.path
+            if p not in ("", ".") and os.path.realpath(p) != _here]
+
+failures = 0
+total = 0
+
+
+def check(label, fn):
+    global failures, total
+    total += 1
+    try:
+        if fn():
+            print("PASS:", label)
+        else:
+            print("FAIL:", label, file=sys.stderr)
+            failures += 1
+    except Exception as exc:
+        print("FAIL:", label, "-", exc, file=sys.stderr)
+        failures += 1
+
+
+try:
+    import regex
+except ImportError as exc:
+    # Report rather than crash, so zopen_check_results sees a count instead of
+    # an empty log.
+    print("FAIL: import regex -", exc, file=sys.stderr)
+    print("regex FAILED to import on Python %s" % sys.version.split()[0])
+    sys.exit(1)
+
+
+# Prove the sys.path surgery above actually worked before trusting anything
+# else: every check below would pass just as happily against the wrong copy.
+#
+# "Not under the build directory" is not the test to make here, tempting as it
+# is. zopen-build creates each interpreter's virtual environment *inside* the
+# source tree, so the correct answer is
+#
+#   <build dir>/.venv/lib/python3.12/site-packages/regex/__init__.py
+#
+# which is under the build directory too. What distinguishes right from wrong
+# is that the wheel's copy sits in a directory component named site-packages
+# and the source copy is exactly <build dir>/regex.
+def imported_from_wheel():
+    where = os.path.realpath(regex.__file__)
+    source_pkg = os.path.join(_here, "regex") + os.sep
+    if "site-packages" in where.split(os.sep) and not where.startswith(source_pkg):
+        return True
+    print("       regex imported from : %s" % where, file=sys.stderr)
+    print("       source tree copy    : %s" % source_pkg, file=sys.stderr)
+    for entry in sys.path[:6]:
+        print("       sys.path: %r" % entry, file=sys.stderr)
+    return False
+
+
+check("regex was imported from the installed wheel, not the source tree",
+      imported_from_wheel)
+
+check("version is the one this port builds",
+      lambda: regex.__version__ == os.environ["REGEX_EXPECTED_VERSION"])
+
+
+# regex has no pure Python fallback -- "import regex" fails outright without
+# the extension -- but the import can still be satisfied by a _regex extension
+# belonging to some other install. Pin down which file is actually loaded, and
+# say enough on failure to tell a failed extension load apart from a shadowed
+# one.
+def uses_c_extension():
+    # importlib, not "import regex._regex": that statement would bind the name
+    # "regex" as a local for this whole function, so the reference to
+    # regex.__file__ in the diagnostics below raises UnboundLocalError before
+    # any of this runs.
+    import importlib
+    import importlib.machinery
+
+    ext = sys.modules.get("regex._regex")
+    if ext is None:
+        ext = importlib.import_module("regex._regex")
+    where = os.path.realpath(getattr(ext, "__file__", ""))
+    suffixes = tuple(importlib.machinery.EXTENSION_SUFFIXES)
+    if where.endswith(suffixes) and "site-packages" in where:
+        return True
+    print("       regex._regex loaded from : %s" % where, file=sys.stderr)
+    print("       extension suffixes       : %s" % (suffixes,), file=sys.stderr)
+    print("       regex imported from      : %s" % regex.__file__, file=sys.stderr)
+    return False
+
+
+check("the compiled regex._regex extension is what is loaded", uses_c_extension)
+
+
+# Call into the extension directly. These are C functions with no Python
+# counterpart, so a module that loaded but did not link properly fails here
+# rather than somewhere less obvious.
+def c_entry_points():
+    import importlib
+
+    ext = importlib.import_module("regex._regex")
+    size = ext.get_code_size()
+    if not isinstance(size, int) or size <= 0:
+        return False
+    # The full case-folding expansion table is built in C from the Unicode
+    # database compiled into _regex_unicode.c.
+    return len(ext.get_expand_on_folding()) > 0
+
+
+check("regex._regex C entry points respond", c_entry_points)
+
+check("groups, named groups and spans",
+      lambda: (lambda m: m is not None
+               and m.group("word") == "abc"
+               and m.group(2) == "123"
+               and m.groups() == ("abc", "123")
+               and m.span() == (0, 7))(
+          regex.match(r"(?P<word>\w+)-(\d+)", "abc-123")))
+
+check("alternation picks the branch that lets the rest match",
+      lambda: regex.fullmatch(r"(?:a|ab)(?:c|bc)d", "abcd") is not None)
+
+# A greedy quantifier that has to give characters back: the C matcher either
+# backtracks correctly or reports no match.
+check("greedy quantifier backtracks",
+      lambda: (lambda m: m is not None and m.group() == "aaab")(
+          regex.fullmatch(r"a*ab", "aaab")))
+
+check("backreference forces a retry",
+      lambda: regex.fullmatch(r"(\w+) \1", "hello hello") is not None
+      and regex.fullmatch(r"(\w+) \1", "hello world") is None)
+
+# Possessive quantifiers are a regex-module feature that re does not have, and
+# they live in the matcher rather than the parser: a*+ must refuse to give back
+# the final "a", so this pattern cannot match.
+check("possessive quantifier does not give back",
+      lambda: regex.match(r"a*+ab", "aaab") is None
+      and regex.fullmatch(r"a*+b", "aaab") is not None)
+
+check("atomic group does not give back",
+      lambda: regex.match(r"(?>a*)ab", "aaab") is None)
+
+# \p{...} needs the Unicode property tables compiled into _regex_unicode.c.
+# Non-ASCII is written as escapes rather than literals throughout: this script
+# is read from stdin on a platform whose default encoding is EBCDIC, and a test
+# should not be able to fail for reasons to do with how it was transmitted.
+check("unicode general category property",
+      lambda: regex.findall(r"\p{Lu}", "aBcD") == ["B", "D"])
+check("unicode script property",
+      lambda: regex.fullmatch(r"\p{Greek}+", "\u03b1\u03b2\u03b3") is not None
+      and regex.fullmatch(r"\p{Greek}+", "abc") is None)
+check("negated unicode property",
+      lambda: regex.findall(r"\P{ASCII}", "a\u00e9b\u4e2d")
+      == ["\u00e9", "\u4e2d"])
+
+# Set operations inside a character class: also regex-only, and only under
+# (?V1). In the default V0 mode regex stays bug-compatible with re, which reads
+# "[[a-z]--[aeiou]]" as the class [a-z-] followed by a literal "]" -- it
+# compiles and matches, just not the way this test means, so the flag is the
+# difference between exercising the set-operation code and not exercising it.
+check("character class set difference",
+      lambda: regex.findall(r"(?V1)[[a-z]--[aeiou]]", "hello") == ["h", "l", "l"])
+check("character class intersection",
+      lambda: regex.findall(r"(?V1)[\w&&[^\d]]", "a1b2") == ["a", "b"])
+
+
+# Fuzzy matching drives the most intricate path in the C matcher: it explores
+# substitutions, insertions and deletions against a cost bound, and (?e) makes
+# it search for the best match rather than the first acceptable one.
+def fuzzy():
+    m = regex.search(r"(?e)(?:foobar){e<=1}", "xx fooxbar yy")
+    if m is None or m.group() != "fooxbar":
+        return False
+    if sum(m.fuzzy_counts) != 1:
+        return False
+    # One error is not enough to reach something two edits away.
+    return regex.search(r"(?:foobar){e<=1}", "fXXbar") is None
+
+
+check("fuzzy matching with an error budget", fuzzy)
+
+check("fuzzy matching respects a per-error-type budget",
+      lambda: regex.fullmatch(r"(?:abcd){s<=1}", "abXd") is not None
+      and regex.fullmatch(r"(?:abcd){i<=1,d<=0,s<=0}", "abXd") is None)
+
+# Full case folding is regex-only and runs through _regex.fold_case, which uses
+# the compiled Unicode tables rather than str.lower(). U+00DF, the sharp s,
+# folds to "ss" -- one character in the pattern matching two in the subject.
+check("full case folding expands the sharp s",
+      lambda: regex.fullmatch(r"(?fi)stra\u00dfe", "STRASSE") is not None)
+
+check("named group in a substitution template",
+      lambda: regex.sub(r"(?P<n>\d+)", r"<\g<n>>", "x12y3") == "x<12>y<3>")
+
+check("split on a character class",
+      lambda: regex.split(r"[,;]\s*", "a, b; c") == ["a", "b", "c"])
+
+
+# --- bytes vs str -------------------------------------------------------
+#
+# This is z/OS: the compiler's own char literals are EBCDIC, so anywhere the
+# extension classifies a byte through the platform's ctype functions instead of
+# its own ASCII tables would show up here and nowhere else. Every expectation
+# below is written as explicit byte values, so the test does not depend on the
+# encoding of the script that carried it either.
+
+check("bytes pattern matches ASCII word characters",
+      lambda: (lambda m: m is not None and m.group() == b"\x61\x62\x63")(
+          regex.fullmatch(rb"\w+", b"\x61\x62\x63")))
+
+# 0x81 is "a" and 0xc1 is "A" in EBCDIC, and neither is a word character in
+# ASCII. If \w came from the platform locale rather than regex's own tables,
+# these match.
+check("bytes \\w does not follow the EBCDIC alphabet",
+      lambda: regex.fullmatch(rb"\w", b"\x81") is None
+      and regex.fullmatch(rb"\w", b"\xc1") is None)
+
+# EBCDIC digits are 0xf0-0xf9.
+check("bytes \\d is ASCII 0x30-0x39",
+      lambda: (lambda m: m is not None and m.group() == b"\x30\x31\x32")(
+          regex.fullmatch(rb"\d+", b"\x30\x31\x32"))
+      and regex.fullmatch(rb"\d", b"\xf0") is None)
+
+check("bytes character range uses byte values",
+      lambda: regex.findall(rb"[\x61-\x63]", b"\x60\x61\x62\x63\x64")
+      == [b"\x61", b"\x62", b"\x63"])
+
+check("bytes case folding is ASCII case folding",
+      lambda: regex.fullmatch(rb"(?i)\x61\x62\x63", b"\x41\x42\x43") is not None
+      and regex.fullmatch(rb"(?i)\x61", b"\x81") is None)
+
+check("bytes \\s is ASCII whitespace",
+      lambda: regex.fullmatch(rb"\s+", b"\x20\x09\x0a") is not None
+      and regex.fullmatch(rb"\s", b"\x41") is None)
+
+
+def bytes_and_str_do_not_mix():
+    try:
+        regex.match(r"\x61", b"\x61")
+    except TypeError:
+        pass
+    else:
+        return False
+    try:
+        regex.match(rb"\x61", "\x61")
+    except TypeError:
+        return True
+    return False
+
+
+check("bytes and str patterns are kept apart", bytes_and_str_do_not_mix)
+
+# The same fuzzy search as above, driven through the bytes matcher: "foobar"
+# within one edit of "fooxbar".
+check("bytes fuzzy matching",
+      lambda: (lambda m: m is not None
+               and m.group() == b"\x66\x6f\x6f\x78\x62\x61\x72"
+               and sum(m.fuzzy_counts) == 1)(
+          regex.search(rb"(?e)(?:\x66\x6f\x6f\x62\x61\x72){e<=1}",
+                       b"\x78\x78\x66\x6f\x6f\x78\x62\x61\x72\x79")))
+
+check("str encodes to bytes the matcher agrees with",
+      lambda: regex.fullmatch(rb"\w+", "abc".encode("utf-8")) is not None)
+
+print()
+print("regex %s on Python %s  --  %d passed, %d failed" % (
+    regex.__version__, sys.version.split()[0], total - failures, failures))
+sys.exit(1 if failures else 0)
+PYEOF
+}
+
+zopen_check_results() {
+  dir="$1"; pfx="$2"; chk="${dir}/${pfx}_check.log"
+  # No "|| echo 0": grep -c prints 0 when nothing matches and also exits 1, so
+  # the fallback appends a second zero and the arithmetic dies with FSUM9224
+  # "bad number" -- on clean runs specifically.
+  passed=$(grep -c "^PASS:" "${chk}" 2>/dev/null)
+  failed=$(grep -c "^FAIL:" "${chk}" 2>/dev/null)
+  passed=${passed:-0}
+  failed=${failed:-0}
+  total=$((passed + failed))
+
+  # An interpreter that printed nothing did not pass, it never ran. Reporting
+  # 0 of 0 as success is how a broken build ships.
+  interpreters=$(grep -c "^regex .* on Python" "${chk}" 2>/dev/null)
+  interpreters=${interpreters:-0}
+  expected=$(echo "${ZOPEN_PYTHON_VERSIONS:-3.12 3.13 3.14}" | wc -w | tr -d ' ')
+  if [ "${interpreters}" -lt "${expected}" ]; then
+    silent=$((expected - interpreters))
+    failed=$((failed + silent))
+    total=$((total + silent))
+  fi
+
+  echo "actualFailures:${failed}"
+  echo "totalTests:${total}"
+  echo "expectedFailures:0"
+}
+
+zopen_append_to_validate_install() {
+  echo "python3 -c \"import regex; print('regex', regex.__version__)\""
+}
