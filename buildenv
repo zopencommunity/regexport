@@ -1,5 +1,5 @@
 # bump: regex-version /REGEX_VERSION="(.*)"/ https://github.com/mrabarnett/mrab-regex.git|semver:*
-REGEX_VERSION="2026.8.31"
+REGEX_VERSION="2026.9.3"
 
 ###
 ### Build control file for the regex port
